@@ -79,6 +79,10 @@ A single cartoon (~12 min) costs approximately:
 
 This tool is intended for **personal, non-commercial use** — parents reading with their own children. It does not host, distribute, or store any copyrighted content. Users are solely responsible for ensuring their use complies with applicable copyright laws and the terms of service of content platforms. The authors assume no liability for how this tool is used.
 
+## Support
+
+If you find this useful, you can [buy me a coffee on Ko-fi](https://ko-fi.com/rafalmcichon).
+
 ## License
 
 MIT
