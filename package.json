@@ -1,0 +1,14 @@
+{
+  "name": "linktotale",
+  "version": "2.0.0",
+  "description": "Paste a YouTube link, get a picture book you can read with your child",
+  "scripts": {
+    "start": "node index.js",
+    "book": "node index.js --book"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "openai": "^6.27.0",
+    "sharp": "^0.34.5"
+  }
+}
