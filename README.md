@@ -17,8 +17,8 @@ The child sees familiar characters and scenes from a cartoon they love, but inst
 ## Quick start
 
 ```bash
-git clone https://github.com/RafalMCichon/youtube-download-with-frames.git
-cd youtube-download-with-frames
+git clone https://github.com/RafalMCichon/linktotale.git
+cd linktotale
 npm install
 echo "OPENAI_API_KEY=your_key_here" > .env
 ```
