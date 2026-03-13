@@ -294,16 +294,51 @@ async function processSubtitles(videoPath) {
     }
   }
   
+  // Check if we have any subtitles
+  const plSrtPath = path.join(DOWNLOADS_DIR, `${baseName}.pl.srt`);
+  const enSrtPath = path.join(DOWNLOADS_DIR, `${baseName}.en.srt`);
+  const transcriptionPlPath = path.join(DOWNLOADS_DIR, `transcription.pl.srt`);
+  const transcriptionEnPath = path.join(DOWNLOADS_DIR, `transcription.en.srt`);
+  
+  const hasPlSubtitles = fs.existsSync(plSrtPath) || fs.existsSync(transcriptionPlPath);
+  const hasEnSubtitles = fs.existsSync(enSrtPath) || fs.existsSync(transcriptionEnPath);
+  
+  // If no subtitles at all, try Whisper transcription
+  if (!hasPlSubtitles && !hasEnSubtitles) {
+    console.log("\n⚠️  No subtitles found. Attempting Whisper transcription...");
+    
+    // Try Polish first
+    const plTranscript = await transcribeAudioWithWhisper(videoPath, "pl");
+    if (plTranscript) {
+      console.log("✓ Polish transcription completed");
+    }
+    
+    // Try English
+    const enTranscript = await transcribeAudioWithWhisper(videoPath, "en");
+    if (enTranscript) {
+      console.log("✓ English transcription completed");
+    }
+    
+    if (!plTranscript && !enTranscript) {
+      console.warn("⚠️  Whisper transcription failed. Book will be generated without dialogue.");
+    }
+  }
+  
   const subtitleFiles = [
     { file: path.join(DOWNLOADS_DIR, `${baseName}.pl.srt`), folder: FRAMES_WITH_SUBTITLES_PL_DIR },
     { file: path.join(DOWNLOADS_DIR, `${baseName}.en.srt`), folder: FRAMES_WITH_SUBTITLES_EN_DIR },
+    { file: transcriptionPlPath, folder: FRAMES_WITH_SUBTITLES_PL_DIR },
+    { file: transcriptionEnPath, folder: FRAMES_WITH_SUBTITLES_EN_DIR },
   ];
+  
   const overlays = [];
   for (const { file, folder } of subtitleFiles) {
     if (fs.existsSync(file)) {
       const outputTextFile = path.join(SUBTITLES_DIR, path.basename(file));
-      fs.copyFileSync(file, outputTextFile);
-      console.log(`Subtitles copied to: ${outputTextFile}`);
+      if (!fs.existsSync(outputTextFile)) {
+        fs.copyFileSync(file, outputTextFile);
+        console.log(`Subtitles copied to: ${outputTextFile}`);
+      }
       overlays.push(overlaySubtitlesOnFrames(file, folder));
     }
   }
@@ -361,11 +396,81 @@ async function overlaySubtitlesOnFrames(subtitleFile, outputFolder) {
 //  Book Pipeline
 // ═════════════════════════════════════════════════════════════
 
+async function transcribeAudioWithWhisper(videoPath, language = "pl") {
+  console.log(`Transcribing audio with Whisper (${language})...`);
+  
+  // Extract audio from video
+  const audioPath = path.join(DOWNLOADS_DIR, `audio_${language}.mp3`);
+  
+  try {
+    // Extract audio using ffmpeg
+    await exec(
+      `ffmpeg -i "${videoPath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`,
+      { maxBuffer: 100 * 1024 * 1024 }
+    );
+    
+    console.log(`Audio extracted to ${audioPath}`);
+    
+    // Transcribe with Whisper
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: "whisper-1",
+      language: language,
+      response_format: "verbose_json",
+      timestamp_granularities: ["segment"]
+    });
+    
+    // Convert Whisper segments to SRT format
+    const srtPath = path.join(DOWNLOADS_DIR, `transcription.${language}.srt`);
+    const srtContent = whisperToSRT(transcription.segments);
+    fs.writeFileSync(srtPath, srtContent, "utf8");
+    
+    console.log(`Transcription saved to ${srtPath}`);
+    
+    // Clean up audio file
+    fs.unlinkSync(audioPath);
+    
+    return srtPath;
+  } catch (error) {
+    console.error(`Whisper transcription failed: ${error.message}`);
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    return null;
+  }
+}
+
+function whisperToSRT(segments) {
+  const lines = [];
+  
+  segments.forEach((segment, index) => {
+    const startTime = formatSRTTimestamp(segment.start);
+    const endTime = formatSRTTimestamp(segment.end);
+    const text = segment.text.trim();
+    
+    if (text) {
+      lines.push(index + 1);
+      lines.push(`${startTime} --> ${endTime}`);
+      lines.push(text);
+      lines.push("");
+    }
+  });
+  
+  return lines.join("\n");
+}
+
+function formatSRTTimestamp(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  const millis = Math.floor((seconds % 1) * 1000);
+  
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")},${String(millis).padStart(3, "0")}`;
+}
+
 function loadSubtitles(lang) {
   const dirs = [SUBTITLES_DIR, DOWNLOADS_DIR];
   for (const dir of dirs) {
     const files = fs.readdirSync(dir).filter(
-      (f) => f.includes(`.${lang}.`) && f.endsWith(".srt")
+      (f) => (f.includes(`.${lang}.`) || f.includes(`transcription.${lang}.`)) && f.endsWith(".srt")
     );
     if (files.length > 0) {
       return parseSRT(fs.readFileSync(path.join(dir, files[0]), "utf8"));
@@ -1357,6 +1462,18 @@ async function main() {
     
     cartoonTitle = getCartoonTitleFromDownloads();
     if (cartoonTitle !== "Unknown") console.log(`Cartoon: "${cartoonTitle}"`);
+    
+    // Find the video file for potential transcription
+    const files = fs.readdirSync(DOWNLOADS_DIR);
+    const videoFile = files.find((f) => 
+      /\.(mp4|mkv|webm|avi|mov|m4a)$/i.test(f) || 
+      (!f.includes('.') && fs.statSync(path.join(DOWNLOADS_DIR, f)).isFile())
+    );
+    
+    if (videoFile) {
+      const videoPath = path.join(DOWNLOADS_DIR, videoFile);
+      await processSubtitles(videoPath);
+    }
   }
 
   await createBook(cartoonTitle);
