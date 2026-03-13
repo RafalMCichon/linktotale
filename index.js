@@ -8,6 +8,18 @@ const OpenAI = require("openai");
 const exec = promisify(execCb);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// ─── Progress Logger ─────────────────────────────────────────
+let _stepNum = 0;
+function step(msg) {
+  _stepNum++;
+  const line = `\n[${ ''}${_stepNum}] ${msg}`;
+  console.log(`\x1b[36m${line}\x1b[0m`);
+  console.log('─'.repeat(50));
+}
+function sub(msg) { console.log(`   → ${msg}`); }
+function done(msg) { console.log(`   ✓ ${msg}`); }
+function warn(msg) { console.log(`   ⚠ ${msg}`); }
+
 // ─── Directories (will be set per video) ────────────────────
 let DOWNLOADS_DIR;
 let FRAMES_DIR;
@@ -100,9 +112,6 @@ function convertVTTtoSRT(vttPath, srtPath) {
     if (line.includes("-->")) {
       // Convert timestamp format from VTT to SRT
       const timestamp = line.replace(/\./g, ",");
-      srtLines.push(counter.toString());
-      srtLines.push(timestamp);
-      counter++;
       i++;
       
       // Collect subtitle text
@@ -116,11 +125,15 @@ function convertVTTtoSRT(vttPath, srtPath) {
       }
       
       if (textLines.length > 0) {
+        srtLines.push(counter.toString());
+        srtLines.push(timestamp);
         srtLines.push(textLines.join("\n"));
         srtLines.push(""); // Empty line between subtitles
+        counter++;
       }
+    } else {
+      i++;
     }
-    i++;
   }
   
   fs.writeFileSync(srtPath, srtLines.join("\n"), "utf8");
@@ -130,10 +143,14 @@ function convertVTTtoSRT(vttPath, srtPath) {
 // ─── Download & Extract ──────────────────────────────────────
 async function installDeps() {
   try {
-    await exec("brew install yt-dlp ffmpeg");
-    console.log("Dependencies checked.");
+    await exec("which yt-dlp && which ffmpeg");
   } catch {
-    console.warn("Warning: could not install yt-dlp/ffmpeg via brew.");
+    try {
+      sub('Installing yt-dlp and ffmpeg via Homebrew...');
+      await exec("brew install yt-dlp ffmpeg");
+    } catch {
+      warn("Could not install yt-dlp/ffmpeg via brew. Make sure they are installed.");
+    }
   }
 }
 
@@ -150,17 +167,14 @@ async function downloadVideo(url, outputTemplate) {
   
   console.log("Starting download...");
   try {
-    const { stdout } = await exec(cmdWithSubs, { maxBuffer: 100 * 1024 * 1024 });
-    if (stdout) process.stdout.write(stdout);
-    console.log("\nDownload completed! Check the 'downloads' folder.");
+    await exec(cmdWithSubs, { maxBuffer: 100 * 1024 * 1024 });
+    done('Download complete (video + subtitles)');
   } catch (e) {
     if (e.message.includes("429") || e.message.includes("Too Many Requests") || e.message.includes("Unable to download video subtitles")) {
-      console.warn("\n⚠️  Subtitle download failed (rate limit). Downloading video only...");
+      warn("Subtitle download failed (rate limit). Downloading video only...");
       try {
-        const { stdout } = await exec(cmdNoSubs, { maxBuffer: 100 * 1024 * 1024 });
-        if (stdout) process.stdout.write(stdout);
-        console.log("\nVideo downloaded! (subtitles unavailable)");
-        console.log("Note: Book generation will work with limited dialogue information.");
+        await exec(cmdNoSubs, { maxBuffer: 100 * 1024 * 1024 });
+        done('Video downloaded (subtitles unavailable — Whisper will be used)');
         return;
       } catch (retryError) {
         console.error("Video download failed:", retryError.message);
@@ -238,14 +252,14 @@ function findExistingVideoFolder() {
 async function extractFrames(videoPath) {
   const existing = fs.readdirSync(FRAMES_DIR).filter((f) => f.endsWith(".png"));
   if (existing.length > 0) {
-    console.log(`Frames already extracted (${existing.length} files). Skipping.`);
+    done(`Frames already extracted (${existing.length} files). Skipping.`);
     return;
   }
   
   // Find the actual video file if videoPath doesn't exist
   let actualVideoPath = videoPath;
   if (!fs.existsSync(videoPath)) {
-    console.log(`Looking for video file in ${DOWNLOADS_DIR}...`);
+    console.log(`Looking for video in ${DOWNLOADS_DIR}...`);
     const files = fs.readdirSync(DOWNLOADS_DIR);
     const videoFile = files.find((f) => 
       /\.(mp4|mkv|webm|avi|mov|m4a)$/i.test(f) || 
@@ -253,18 +267,19 @@ async function extractFrames(videoPath) {
     );
     if (videoFile) {
       actualVideoPath = path.join(DOWNLOADS_DIR, videoFile);
-      console.log(`Found video: ${videoFile}`);
+      sub(`Found video: ${videoFile}`);
     } else {
       throw new Error("No video file found in downloads directory");
     }
   }
   
-  console.log("Extracting frames from video...");
+  sub('Extracting frames from video...');
   await exec(
     `ffmpeg -i "${actualVideoPath}" -vf "fps=1" "${FRAMES_DIR}/frame_%04d.png"`,
     { maxBuffer: 100 * 1024 * 1024 }
   );
-  console.log("Frames extracted successfully!");
+  const newFrames = fs.readdirSync(FRAMES_DIR).filter((f) => f.endsWith(".png"));
+  done(`${newFrames.length} frames extracted`);
 }
 
 // ─── Subtitle Overlay ────────────────────────────────────────
@@ -278,7 +293,6 @@ function convertTimestampToFrame(timestamp) {
 }
 
 async function processSubtitles(videoPath) {
-  console.log("Processing subtitles...");
   const baseName = path.basename(videoPath, path.extname(videoPath));
   
   // Convert VTT to SRT if needed
@@ -289,7 +303,7 @@ async function processSubtitles(videoPath) {
   
   for (const { vtt, srt } of vttFiles) {
     if (fs.existsSync(vtt) && !fs.existsSync(srt)) {
-      console.log(`Converting ${path.basename(vtt)} to SRT...`);
+      sub(`Converting ${path.basename(vtt)} to SRT...`);
       convertVTTtoSRT(vtt, srt);
     }
   }
@@ -305,22 +319,22 @@ async function processSubtitles(videoPath) {
   
   // If no subtitles at all, try Whisper transcription
   if (!hasPlSubtitles && !hasEnSubtitles) {
-    console.log("\n⚠️  No subtitles found. Attempting Whisper transcription...");
+    warn("No subtitles found. Attempting Whisper transcription...");
     
     // Try Polish first
     const plTranscript = await transcribeAudioWithWhisper(videoPath, "pl");
     if (plTranscript) {
-      console.log("✓ Polish transcription completed");
+      done("Polish transcription completed");
     }
     
     // Try English
     const enTranscript = await transcribeAudioWithWhisper(videoPath, "en");
     if (enTranscript) {
-      console.log("✓ English transcription completed");
+      done("English transcription completed");
     }
     
     if (!plTranscript && !enTranscript) {
-      console.warn("⚠️  Whisper transcription failed. Book will be generated without dialogue.");
+      warn("Whisper transcription failed. Book will be generated without dialogue.");
     }
   }
   
@@ -346,50 +360,44 @@ async function processSubtitles(videoPath) {
 }
 
 async function overlaySubtitlesOnFrames(subtitleFile, outputFolder) {
-  console.log(`Overlaying subtitles on frames for ${subtitleFile}...`);
+  sub(`Overlaying subtitles: ${path.basename(subtitleFile)}`);
   const subtitleText = fs.readFileSync(subtitleFile, "utf8");
-  const lines = subtitleText.split("\n");
-  let subtitleMap = {};
-  let currentText = "";
+  const subs = parseSRT(subtitleText);
+  const subtitleMap = {};
 
-  lines.forEach((line) => {
-    const timestampMatch = line.match(
-      /(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})/
-    );
-    if (!timestampMatch && line.trim() !== "" && isNaN(line.trim())) {
-      currentText += line.trim() + " ";
-    } else if (timestampMatch) {
-      const frameNumber = convertTimestampToFrame(timestampMatch[1]);
-      if (currentText.trim() !== "") {
-        subtitleMap[frameNumber] = currentText
-          .trim()
-          .replace(/:/g, "\\:")
-          .replace(/'/g, "\\'");
-        currentText = "";
-      }
-    }
-  });
+  for (const s of subs) {
+    const escaped = s.text.replace(/:/g, "\\:").replace(/'/g, "\\'");
+    subtitleMap[s.startFrame] = escaped;
+  }
 
-  const promises = [];
-  for (const [frameNumber, text] of Object.entries(subtitleMap)) {
-    const framePath = path.join(
-      FRAMES_DIR,
-      `frame_${String(frameNumber).padStart(4, "0")}.png`
-    );
-    const outputFramePath = path.join(
-      outputFolder,
-      `frame_${String(frameNumber).padStart(4, "0")}.png`
-    );
-    if (fs.existsSync(framePath)) {
-      promises.push(
-        exec(
-          `ffmpeg -i "${framePath}" -vf "drawtext=text='${text}':fontcolor=white:fontsize=54:x=(w-text_w)/2:y=h-50" -y "${outputFramePath}"`
-        ).catch((err) => console.error("Error overlaying text on frame:", err.message))
+  const entries = Object.entries(subtitleMap);
+  const CONCURRENCY = 8;
+  let completed = 0;
+
+  for (let i = 0; i < entries.length; i += CONCURRENCY) {
+    const batch = entries.slice(i, i + CONCURRENCY);
+    const promises = batch.map(([frameNumber, text]) => {
+      const framePath = path.join(
+        FRAMES_DIR,
+        `frame_${String(frameNumber).padStart(4, "0")}.png`
       );
+      const outputFramePath = path.join(
+        outputFolder,
+        `frame_${String(frameNumber).padStart(4, "0")}.png`
+      );
+      if (!fs.existsSync(framePath)) return Promise.resolve();
+      return exec(
+        `ffmpeg -i "${framePath}" -vf "drawtext=text='${text}':fontcolor=white:fontsize=54:x=(w-text_w)/2:y=h-50" -y "${outputFramePath}"`
+      )
+        .then(() => { completed++; })
+        .catch((err) => { completed++; console.error("Error overlaying text on frame:", err.message); });
+    });
+    await Promise.all(promises);
+    if (i + CONCURRENCY < entries.length) {
+      process.stdout.write(`   → Subtitle overlay: ${completed}/${entries.length}\r`);
     }
   }
-  await Promise.all(promises);
-  console.log(`Subtitles overlay completed! Check the '${outputFolder}' folder.`);
+  done(`Subtitle overlay done (${completed} frames)`);
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -397,7 +405,7 @@ async function overlaySubtitlesOnFrames(subtitleFile, outputFolder) {
 // ═════════════════════════════════════════════════════════════
 
 async function transcribeAudioWithWhisper(videoPath, language = "pl") {
-  console.log(`Transcribing audio with Whisper (${language})...`);
+  sub(`Transcribing audio with Whisper (${language})...`);
   
   // Extract audio from video
   const audioPath = path.join(DOWNLOADS_DIR, `audio_${language}.mp3`);
@@ -409,7 +417,7 @@ async function transcribeAudioWithWhisper(videoPath, language = "pl") {
       { maxBuffer: 100 * 1024 * 1024 }
     );
     
-    console.log(`Audio extracted to ${audioPath}`);
+    sub(`Audio extracted, sending to Whisper...`);
     
     // Transcribe with Whisper
     const transcription = await openai.audio.transcriptions.create({
@@ -425,7 +433,7 @@ async function transcribeAudioWithWhisper(videoPath, language = "pl") {
     const srtContent = whisperToSRT(transcription.segments);
     fs.writeFileSync(srtPath, srtContent, "utf8");
     
-    console.log(`Transcription saved to ${srtPath}`);
+    done(`Transcription saved (${language})`);
     
     // Clean up audio file
     fs.unlinkSync(audioPath);
@@ -519,7 +527,7 @@ async function detectSceneChanges(threshold = 0.12) {
       scenes.push({ frame: files[i], frameNumber: frameNum, diff });
     }
     prevHash = currentHash;
-    if (i % 100 === 0) console.log(`  Scene detection: ${i}/${files.length}`);
+    if (i % 100 === 0) process.stdout.write(`   → Scene detection: ${i}/${files.length}\r`);
   }
   return scenes;
 }
@@ -587,38 +595,34 @@ async function analyzeFrameForBook(framePath, context) {
 }
 
 async function createBook(cartoonTitle = "Unknown") {
-  console.log("\n╔══════════════════════════════════════╗");
-  console.log("║    Creating Enhanced Book            ║");
-  console.log("╚══════════════════════════════════════╝\n");
-
   const frameFiles = fs.readdirSync(FRAMES_DIR).filter((f) => f.endsWith(".png")).sort();
   if (frameFiles.length === 0) {
     console.error("No frames found. Run download first.");
     return;
   }
-  console.log(`Frames: ${frameFiles.length}`);
 
   const subtitlesPL = loadSubtitles("pl");
   const subtitlesEN = loadSubtitles("en");
   const primarySubs = subtitlesPL.length > 0 ? subtitlesPL : subtitlesEN;
-  console.log(`Subtitles: ${subtitlesPL.length} PL, ${subtitlesEN.length} EN`);
 
   if (primarySubs.length === 0) {
-    console.error("No subtitles found.");
+    console.error("No subtitles found. Cannot generate book without dialogue.");
     return;
   }
 
+  sub(`Frames: ${frameFiles.length}, Subtitles: ${subtitlesPL.length} PL / ${subtitlesEN.length} EN`);
+
   const analyses = loadExistingAnalyses();
-  console.log(`Existing frame analyses: ${Object.keys(analyses).length}`);
+  if (Object.keys(analyses).length > 0) sub(`Cached frame analyses: ${Object.keys(analyses).length}`);
 
   // ── Scene detection ──
-  console.log("\nDetecting scene changes...");
+  step('Detecting scene changes');
   const sceneChanges = await detectSceneChanges();
-  console.log(`Scene changes found: ${sceneChanges.length}`);
+  done(`${sceneChanges.length} scene changes found`);
 
   // ── Find dialogue gaps ──
   const gaps = findDialogueGaps(primarySubs, frameFiles.length);
-  console.log(`Dialogue gaps (3+ sec): ${gaps.length}`);
+  sub(`${gaps.length} dialogue gaps (3+ sec)`);
 
   // ── Select narration candidates from gaps ──
   const narrationCache = {};
@@ -676,40 +680,32 @@ async function createBook(cartoonTitle = "Unknown") {
   }
 
   fs.writeFileSync(narrationCacheFile, JSON.stringify(narrationCache, null, 2), "utf8");
-  console.log(`\nNarration frames selected: ${narrationFrames.length}`);
+  done(`${narrationFrames.length} narration frames selected`);
 
-  // ── Build timeline for GPT-4o ──
-  console.log("\nBuilding story timeline...");
+  step('Building story timeline');
   const timeline = buildTimeline(subtitlesPL, subtitlesEN, narrationFrames);
-
-  // ── Select key frames to send as images to GPT-4o ──
   const keyFrameNumbers = selectKeyFrames(timeline, sceneChanges, frameFiles.length);
-  console.log(`Key frames for story: ${keyFrameNumbers.length}`);
+  done(`Timeline: ${timeline.length} events, ${keyFrameNumbers.length} key frames`);
 
-  // ── Generate stories ──
-  console.log("\nGenerating PL story with GPT-4.1...");
+  step('Generating PL story (GPT-4.1)');
   const storyPL = await generateBookStory(timeline, keyFrameNumbers, frameFiles.length, "pl", cartoonTitle);
+  done(`PL: "${storyPL.title}" — ${storyPL.pages?.length || 0} pages`);
 
-  console.log("Generating EN story with GPT-4.1...");
+  step('Generating EN story (GPT-4.1)');
   const storyEN = await generateBookStory(timeline, keyFrameNumbers, frameFiles.length, "en", cartoonTitle);
+  done(`EN: "${storyEN.title}" — ${storyEN.pages?.length || 0} pages`);
 
-  // ── Verify and fix frame selections with Vision AI ──
-  console.log("\nVerifying frame-text alignment (Vision AI)...");
+  step('Verifying frame-text alignment (Vision AI)');
   await verifyFramesWithVision(storyPL, analyses, frameFiles.length);
-  console.log("  PL verification complete.");
+  done('PL verification complete');
   await verifyFramesWithVision(storyEN, analyses, frameFiles.length);
-  console.log("  EN verification complete.");
+  done('EN verification complete');
 
-  // ── Build HTML books ──
-  console.log("\nBuilding HTML books...");
+  step('Building HTML books');
   buildHTMLBook(storyPL, "pl");
   buildHTMLBook(storyEN, "en");
-
-  console.log("\n╔══════════════════════════════════════╗");
-  console.log("║    Book created!                     ║");
-  console.log("╚══════════════════════════════════════╝");
-  console.log(`  PL: ${path.join(BOOK_DIR, "book-pl.html")}`);
-  console.log(`  EN: ${path.join(BOOK_DIR, "book-en.html")}`);
+  done(`PL: ${path.join(BOOK_DIR, "book-pl.html")}`);
+  done(`EN: ${path.join(BOOK_DIR, "book-en.html")}`);
 }
 
 function buildTimeline(subtitlesPL, subtitlesEN, narrationFrames) {
@@ -1438,17 +1434,29 @@ async function main() {
   let cartoonTitle = "Unknown";
   let videoId;
 
+  console.log('\n╔══════════════════════════════════════════════════╗');
+  console.log('║           LinkToTale — Picture Book Pipeline      ║');
+  console.log('╚══════════════════════════════════════════════════╝\n');
+
   if (videoUrl) {
     videoId = extractVideoId(videoUrl);
-    console.log(`Video ID: ${videoId}`);
     initDirectories(videoId);
-    
+
+    step('Getting video info');
     cartoonTitle = await getVideoTitle(videoUrl);
-    console.log(`Cartoon: "${cartoonTitle}"`);
+    done(`Title: "${cartoonTitle}"`);
+    done(`Video ID: ${videoId}`);
+
+    step('Downloading video + subtitles');
     const outputTemplate = path.join(DOWNLOADS_DIR, "%(title)s");
     await downloadVideo(videoUrl, outputTemplate);
     const videoPath = await getVideoFilename(videoUrl, outputTemplate);
+    done('Download complete');
+
+    step('Extracting frames (1 FPS)');
     await extractFrames(videoPath);
+
+    step('Processing subtitles');
     await processSubtitles(videoPath);
   } else {
     // --book mode: find most recent video folder
@@ -1457,11 +1465,12 @@ async function main() {
       console.error("No existing video folders found in downloads/");
       process.exit(1);
     }
-    console.log(`Using existing folder: ${videoId}`);
     initDirectories(videoId);
-    
+
+    step('Loading existing data');
+    done(`Folder: ${videoId}`);
     cartoonTitle = getCartoonTitleFromDownloads();
-    if (cartoonTitle !== "Unknown") console.log(`Cartoon: "${cartoonTitle}"`);
+    if (cartoonTitle !== "Unknown") done(`Title: "${cartoonTitle}"`);
     
     // Find the video file for potential transcription
     const files = fs.readdirSync(DOWNLOADS_DIR);
@@ -1471,14 +1480,19 @@ async function main() {
     );
     
     if (videoFile) {
+      step('Processing subtitles');
       const videoPath = path.join(DOWNLOADS_DIR, videoFile);
       await processSubtitles(videoPath);
     }
   }
 
+  step('Generating picture book');
   await createBook(cartoonTitle);
   
   console.log(`\n📁 All files saved in: downloads/${videoId}/`);
+  console.log('\n╔══════════════════════════════════════════════════╗');
+  console.log('║                    All done!                     ║');
+  console.log('╚══════════════════════════════════════════════════╝');
 }
 
 main().catch((err) => {

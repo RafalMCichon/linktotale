@@ -4,7 +4,8 @@
   "description": "Paste a YouTube link, get a picture book you can read with your child",
   "scripts": {
     "start": "node index.js",
-    "book": "node index.js --book"
+    "book": "node index.js --book",
+    "serve": "node server.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
