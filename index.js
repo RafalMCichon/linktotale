@@ -8,20 +8,46 @@ const OpenAI = require("openai");
 const exec = promisify(execCb);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ─── Directories ─────────────────────────────────────────────
-const DOWNLOADS_DIR = path.join(__dirname, "downloads");
-const FRAMES_DIR = path.join(DOWNLOADS_DIR, "frames");
-const FRAMES_WITH_SUBTITLES_PL_DIR = path.join(DOWNLOADS_DIR, "frames-with-subtitles-pl");
-const FRAMES_WITH_SUBTITLES_EN_DIR = path.join(DOWNLOADS_DIR, "frames-with-subtitles-en");
-const SUBTITLES_DIR = path.join(DOWNLOADS_DIR, "subtitles");
-const ANALYSIS_DIR = path.join(DOWNLOADS_DIR, "frames-analysis");
-const BOOK_DIR = path.join(DOWNLOADS_DIR, "book");
+// ─── Directories (will be set per video) ────────────────────
+let DOWNLOADS_DIR;
+let FRAMES_DIR;
+let FRAMES_WITH_SUBTITLES_PL_DIR;
+let FRAMES_WITH_SUBTITLES_EN_DIR;
+let SUBTITLES_DIR;
+let ANALYSIS_DIR;
+let BOOK_DIR;
 
-[DOWNLOADS_DIR, FRAMES_DIR, FRAMES_WITH_SUBTITLES_PL_DIR,
- FRAMES_WITH_SUBTITLES_EN_DIR, SUBTITLES_DIR, ANALYSIS_DIR,
- BOOK_DIR].forEach(d => {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-});
+function initDirectories(videoId) {
+  DOWNLOADS_DIR = path.join(__dirname, "downloads", videoId);
+  FRAMES_DIR = path.join(DOWNLOADS_DIR, "frames");
+  FRAMES_WITH_SUBTITLES_PL_DIR = path.join(DOWNLOADS_DIR, "frames-with-subtitles-pl");
+  FRAMES_WITH_SUBTITLES_EN_DIR = path.join(DOWNLOADS_DIR, "frames-with-subtitles-en");
+  SUBTITLES_DIR = path.join(DOWNLOADS_DIR, "subtitles");
+  ANALYSIS_DIR = path.join(DOWNLOADS_DIR, "frames-analysis");
+  BOOK_DIR = path.join(DOWNLOADS_DIR, "book");
+
+  [DOWNLOADS_DIR, FRAMES_DIR, FRAMES_WITH_SUBTITLES_PL_DIR,
+   FRAMES_WITH_SUBTITLES_EN_DIR, SUBTITLES_DIR, ANALYSIS_DIR,
+   BOOK_DIR].forEach(d => {
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+  });
+}
+
+function extractVideoId(url) {
+  // Extract YouTube video ID from various URL formats
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+    /^([a-zA-Z0-9_-]{11})$/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  
+  // Fallback: use sanitized URL as folder name
+  return url.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50);
+}
 
 // ─── Correct SRT Parser ─────────────────────────────────────
 function parseSRT(content) {
@@ -32,7 +58,7 @@ function parseSRT(content) {
     const tsLine = lines.find((l) => l.includes(" --> "));
     if (!tsLine) continue;
     const m = tsLine.match(
-      /(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})/
+      /(\d{2}:\d{2}:\d{2}[.,]\d{3}) --> (\d{2}:\d{2}:\d{2}[.,]\d{3})/
     );
     if (!m) continue;
     const textLines = lines.slice(lines.indexOf(tsLine) + 1);
@@ -54,6 +80,53 @@ function tsToSec(ts) {
   return parseInt(h) * 3600 + parseInt(m) * 60 + parseFloat(rest.replace(",", "."));
 }
 
+function convertVTTtoSRT(vttPath, srtPath) {
+  if (!fs.existsSync(vttPath)) return false;
+  
+  const vttContent = fs.readFileSync(vttPath, "utf8");
+  const lines = vttContent.split("\n");
+  const srtLines = [];
+  let counter = 1;
+  let i = 0;
+  
+  // Skip VTT header
+  while (i < lines.length && !lines[i].includes("-->")) {
+    i++;
+  }
+  
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    
+    if (line.includes("-->")) {
+      // Convert timestamp format from VTT to SRT
+      const timestamp = line.replace(/\./g, ",");
+      srtLines.push(counter.toString());
+      srtLines.push(timestamp);
+      counter++;
+      i++;
+      
+      // Collect subtitle text
+      const textLines = [];
+      while (i < lines.length && lines[i].trim() !== "" && !lines[i].includes("-->")) {
+        const text = lines[i].trim();
+        // Remove VTT tags like <c> </c>
+        const cleanText = text.replace(/<[^>]+>/g, "");
+        if (cleanText) textLines.push(cleanText);
+        i++;
+      }
+      
+      if (textLines.length > 0) {
+        srtLines.push(textLines.join("\n"));
+        srtLines.push(""); // Empty line between subtitles
+      }
+    }
+    i++;
+  }
+  
+  fs.writeFileSync(srtPath, srtLines.join("\n"), "utf8");
+  return true;
+}
+
 // ─── Download & Extract ──────────────────────────────────────
 async function installDeps() {
   try {
@@ -65,27 +138,64 @@ async function installDeps() {
 }
 
 async function downloadVideo(url, outputTemplate) {
-  const cmd = `yt-dlp -f "bv*+ba/best" --write-sub --write-auto-sub --sub-lang pl,en --convert-subs srt -o "${outputTemplate}" "${url}"`;
+  // Check if cookies.json exists, otherwise use browser cookies
+  const cookiesPath = path.join(__dirname, "cookies.json");
+  const cookiesArg = fs.existsSync(cookiesPath) 
+    ? `--cookies "${cookiesPath}"` 
+    : "--cookies-from-browser chrome";
+  
+  // Try with subtitles first, if fails try without
+  const cmdWithSubs = `yt-dlp -f "bv*+ba/best" --write-sub --write-auto-sub --sub-lang pl,en --convert-subs srt --sleep-requests 1 --sleep-subtitles 2 ${cookiesArg} -o "${outputTemplate}" "${url}"`;
+  const cmdNoSubs = `yt-dlp -f "bv*+ba/best" ${cookiesArg} -o "${outputTemplate}" "${url}"`;
+  
   console.log("Starting download...");
   try {
-    const { stdout } = await exec(cmd, { maxBuffer: 100 * 1024 * 1024 });
+    const { stdout } = await exec(cmdWithSubs, { maxBuffer: 100 * 1024 * 1024 });
     if (stdout) process.stdout.write(stdout);
     console.log("\nDownload completed! Check the 'downloads' folder.");
   } catch (e) {
+    if (e.message.includes("429") || e.message.includes("Too Many Requests") || e.message.includes("Unable to download video subtitles")) {
+      console.warn("\n⚠️  Subtitle download failed (rate limit). Downloading video only...");
+      try {
+        const { stdout } = await exec(cmdNoSubs, { maxBuffer: 100 * 1024 * 1024 });
+        if (stdout) process.stdout.write(stdout);
+        console.log("\nVideo downloaded! (subtitles unavailable)");
+        console.log("Note: Book generation will work with limited dialogue information.");
+        return;
+      } catch (retryError) {
+        console.error("Video download failed:", retryError.message);
+        process.exit(1);
+      }
+    }
+    
     console.error("Download failed:", e.message);
+    if (e.message.includes("Sign in to confirm")) {
+      console.error("\n⚠️  YouTube requires authentication.");
+      console.error("Solutions:");
+      console.error("1. Make sure you're logged into YouTube in Chrome");
+      console.error("2. Or export cookies from your browser to cookies.json");
+    }
     process.exit(1);
   }
 }
 
 async function getVideoFilename(url, outputTemplate) {
-  const cmd = `yt-dlp --get-filename -o "${outputTemplate}.%(ext)s" "${url}"`;
+  const cookiesPath = path.join(__dirname, "cookies.json");
+  const cookiesArg = fs.existsSync(cookiesPath) 
+    ? `--cookies "${cookiesPath}"` 
+    : "--cookies-from-browser chrome";
+  const cmd = `yt-dlp --get-filename ${cookiesArg} -o "${outputTemplate}.%(ext)s" "${url}"`;
   const { stdout } = await exec(cmd);
   return stdout.trim();
 }
 
 async function getVideoTitle(url) {
   try {
-    const { stdout } = await exec(`yt-dlp --get-title "${url}"`);
+    const cookiesPath = path.join(__dirname, "cookies.json");
+    const cookiesArg = fs.existsSync(cookiesPath) 
+      ? `--cookies "${cookiesPath}"` 
+      : "--cookies-from-browser chrome";
+    const { stdout } = await exec(`yt-dlp --get-title ${cookiesArg} "${url}"`);
     return stdout.trim() || "Unknown";
   } catch {
     return "Unknown";
@@ -102,15 +212,56 @@ function getCartoonTitleFromDownloads() {
   return path.basename(videoOrSrt, path.extname(videoOrSrt));
 }
 
+function findExistingVideoFolder() {
+  const downloadsRoot = path.join(__dirname, "downloads");
+  if (!fs.existsSync(downloadsRoot)) return null;
+  
+  const folders = fs.readdirSync(downloadsRoot).filter(f => {
+    const fullPath = path.join(downloadsRoot, f);
+    return fs.statSync(fullPath).isDirectory();
+  });
+  
+  if (folders.length === 0) return null;
+  
+  // Return the most recently modified folder
+  const sorted = folders
+    .map(f => ({
+      name: f,
+      path: path.join(downloadsRoot, f),
+      mtime: fs.statSync(path.join(downloadsRoot, f)).mtime
+    }))
+    .sort((a, b) => b.mtime - a.mtime);
+  
+  return sorted[0].name;
+}
+
 async function extractFrames(videoPath) {
   const existing = fs.readdirSync(FRAMES_DIR).filter((f) => f.endsWith(".png"));
   if (existing.length > 0) {
     console.log(`Frames already extracted (${existing.length} files). Skipping.`);
     return;
   }
+  
+  // Find the actual video file if videoPath doesn't exist
+  let actualVideoPath = videoPath;
+  if (!fs.existsSync(videoPath)) {
+    console.log(`Looking for video file in ${DOWNLOADS_DIR}...`);
+    const files = fs.readdirSync(DOWNLOADS_DIR);
+    const videoFile = files.find((f) => 
+      /\.(mp4|mkv|webm|avi|mov|m4a)$/i.test(f) || 
+      (!f.includes('.') && fs.statSync(path.join(DOWNLOADS_DIR, f)).isFile())
+    );
+    if (videoFile) {
+      actualVideoPath = path.join(DOWNLOADS_DIR, videoFile);
+      console.log(`Found video: ${videoFile}`);
+    } else {
+      throw new Error("No video file found in downloads directory");
+    }
+  }
+  
   console.log("Extracting frames from video...");
   await exec(
-    `ffmpeg -i "${videoPath}" -vf "fps=1" "${FRAMES_DIR}/frame_%04d.png"`,
+    `ffmpeg -i "${actualVideoPath}" -vf "fps=1" "${FRAMES_DIR}/frame_%04d.png"`,
     { maxBuffer: 100 * 1024 * 1024 }
   );
   console.log("Frames extracted successfully!");
@@ -129,6 +280,20 @@ function convertTimestampToFrame(timestamp) {
 async function processSubtitles(videoPath) {
   console.log("Processing subtitles...");
   const baseName = path.basename(videoPath, path.extname(videoPath));
+  
+  // Convert VTT to SRT if needed
+  const vttFiles = [
+    { vtt: path.join(DOWNLOADS_DIR, `${baseName}.pl.vtt`), srt: path.join(DOWNLOADS_DIR, `${baseName}.pl.srt`) },
+    { vtt: path.join(DOWNLOADS_DIR, `${baseName}.en.vtt`), srt: path.join(DOWNLOADS_DIR, `${baseName}.en.srt`) },
+  ];
+  
+  for (const { vtt, srt } of vttFiles) {
+    if (fs.existsSync(vtt) && !fs.existsSync(srt)) {
+      console.log(`Converting ${path.basename(vtt)} to SRT...`);
+      convertVTTtoSRT(vtt, srt);
+    }
+  }
+  
   const subtitleFiles = [
     { file: path.join(DOWNLOADS_DIR, `${baseName}.pl.srt`), folder: FRAMES_WITH_SUBTITLES_PL_DIR },
     { file: path.join(DOWNLOADS_DIR, `${baseName}.en.srt`), folder: FRAMES_WITH_SUBTITLES_EN_DIR },
@@ -1166,7 +1331,13 @@ async function main() {
   await installDeps();
 
   let cartoonTitle = "Unknown";
+  let videoId;
+
   if (videoUrl) {
+    videoId = extractVideoId(videoUrl);
+    console.log(`Video ID: ${videoId}`);
+    initDirectories(videoId);
+    
     cartoonTitle = await getVideoTitle(videoUrl);
     console.log(`Cartoon: "${cartoonTitle}"`);
     const outputTemplate = path.join(DOWNLOADS_DIR, "%(title)s");
@@ -1175,11 +1346,22 @@ async function main() {
     await extractFrames(videoPath);
     await processSubtitles(videoPath);
   } else {
+    // --book mode: find most recent video folder
+    videoId = findExistingVideoFolder();
+    if (!videoId) {
+      console.error("No existing video folders found in downloads/");
+      process.exit(1);
+    }
+    console.log(`Using existing folder: ${videoId}`);
+    initDirectories(videoId);
+    
     cartoonTitle = getCartoonTitleFromDownloads();
     if (cartoonTitle !== "Unknown") console.log(`Cartoon: "${cartoonTitle}"`);
   }
 
   await createBook(cartoonTitle);
+  
+  console.log(`\n📁 All files saved in: downloads/${videoId}/`);
 }
 
 main().catch((err) => {
