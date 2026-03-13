@@ -113,4 +113,5 @@ cookies.json
 
 downloads/
 
-.kiro.vscode/
+.kiro/
+.vscode/
