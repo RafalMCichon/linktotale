@@ -83,6 +83,25 @@ async function getVideoFilename(url, outputTemplate) {
   return stdout.trim();
 }
 
+async function getVideoTitle(url) {
+  try {
+    const { stdout } = await exec(`yt-dlp --get-title "${url}"`);
+    return stdout.trim() || "Unknown";
+  } catch {
+    return "Unknown";
+  }
+}
+
+function getCartoonTitleFromDownloads() {
+  if (!fs.existsSync(DOWNLOADS_DIR)) return "Unknown";
+  const files = fs.readdirSync(DOWNLOADS_DIR);
+  const videoOrSrt = files.find((f) =>
+    /\.(mp4|mkv|webm|avi|mov|srt)$/i.test(f)
+  );
+  if (!videoOrSrt) return "Unknown";
+  return path.basename(videoOrSrt, path.extname(videoOrSrt));
+}
+
 async function extractFrames(videoPath) {
   const existing = fs.readdirSync(FRAMES_DIR).filter((f) => f.endsWith(".png"));
   if (existing.length > 0) {
@@ -107,24 +126,26 @@ function convertTimestampToFrame(timestamp) {
   return Math.floor(totalSeconds);
 }
 
-function processSubtitles(videoPath) {
+async function processSubtitles(videoPath) {
   console.log("Processing subtitles...");
   const baseName = path.basename(videoPath, path.extname(videoPath));
   const subtitleFiles = [
     { file: path.join(DOWNLOADS_DIR, `${baseName}.pl.srt`), folder: FRAMES_WITH_SUBTITLES_PL_DIR },
     { file: path.join(DOWNLOADS_DIR, `${baseName}.en.srt`), folder: FRAMES_WITH_SUBTITLES_EN_DIR },
   ];
-  subtitleFiles.forEach(({ file, folder }) => {
+  const overlays = [];
+  for (const { file, folder } of subtitleFiles) {
     if (fs.existsSync(file)) {
       const outputTextFile = path.join(SUBTITLES_DIR, path.basename(file));
       fs.copyFileSync(file, outputTextFile);
       console.log(`Subtitles copied to: ${outputTextFile}`);
-      overlaySubtitlesOnFrames(file, folder);
+      overlays.push(overlaySubtitlesOnFrames(file, folder));
     }
-  });
+  }
+  await Promise.all(overlays);
 }
 
-function overlaySubtitlesOnFrames(subtitleFile, outputFolder) {
+async function overlaySubtitlesOnFrames(subtitleFile, outputFolder) {
   console.log(`Overlaying subtitles on frames for ${subtitleFile}...`);
   const subtitleText = fs.readFileSync(subtitleFile, "utf8");
   const lines = subtitleText.split("\n");
@@ -149,7 +170,8 @@ function overlaySubtitlesOnFrames(subtitleFile, outputFolder) {
     }
   });
 
-  Object.entries(subtitleMap).forEach(([frameNumber, text]) => {
+  const promises = [];
+  for (const [frameNumber, text] of Object.entries(subtitleMap)) {
     const framePath = path.join(
       FRAMES_DIR,
       `frame_${String(frameNumber).padStart(4, "0")}.png`
@@ -159,14 +181,14 @@ function overlaySubtitlesOnFrames(subtitleFile, outputFolder) {
       `frame_${String(frameNumber).padStart(4, "0")}.png`
     );
     if (fs.existsSync(framePath)) {
-      execCb(
-        `ffmpeg -i "${framePath}" -vf "drawtext=text='${text}':fontcolor=white:fontsize=54:x=(w-text_w)/2:y=h-50" -y "${outputFramePath}"`,
-        (error) => {
-          if (error) console.error("Error overlaying text on frame:", error.message);
-        }
+      promises.push(
+        exec(
+          `ffmpeg -i "${framePath}" -vf "drawtext=text='${text}':fontcolor=white:fontsize=54:x=(w-text_w)/2:y=h-50" -y "${outputFramePath}"`
+        ).catch((err) => console.error("Error overlaying text on frame:", err.message))
       );
     }
-  });
+  }
+  await Promise.all(promises);
   console.log(`Subtitles overlay completed! Check the '${outputFolder}' folder.`);
 }
 
@@ -266,7 +288,8 @@ async function analyzeFrameForBook(framePath, context) {
   const imageData = fs.readFileSync(framePath);
   const base64Image = `data:image/png;base64,${imageData.toString("base64")}`;
 
-  let ctx = "This is a frame from a children's cartoon called 'Milo Mechanik' (Milo the Mechanic).";
+  const title = (context.cartoonTitle || "Unknown").replace(/'/g, "\\'");
+  let ctx = `This is a frame from a children's cartoon called '${title}'.`;
   if (context.prevDialogue) ctx += ` Previous dialogue: "${context.prevDialogue}".`;
   if (context.nextDialogue) ctx += ` Next dialogue: "${context.nextDialogue}".`;
 
@@ -293,7 +316,7 @@ async function analyzeFrameForBook(framePath, context) {
   }
 }
 
-async function createBook() {
+async function createBook(cartoonTitle = "Unknown") {
   console.log("\n╔══════════════════════════════════════╗");
   console.log("║    Creating Enhanced Book            ║");
   console.log("╚══════════════════════════════════════╝\n");
@@ -366,7 +389,7 @@ async function createBook() {
         console.log(`  Vision AI: frame ${candidate.frameNumber}...`);
         analysis = await analyzeFrameForBook(
           path.join(FRAMES_DIR, candidate.frame),
-          { prevDialogue: gap.prevDialogue, nextDialogue: gap.nextDialogue }
+          { prevDialogue: gap.prevDialogue, nextDialogue: gap.nextDialogue, cartoonTitle }
         );
         narrationCache[cacheKey] = analysis;
       }
@@ -395,10 +418,10 @@ async function createBook() {
 
   // ── Generate stories ──
   console.log("\nGenerating PL story with GPT-4.1...");
-  const storyPL = await generateBookStory(timeline, keyFrameNumbers, frameFiles.length, "pl");
+  const storyPL = await generateBookStory(timeline, keyFrameNumbers, frameFiles.length, "pl", cartoonTitle);
 
   console.log("Generating EN story with GPT-4.1...");
-  const storyEN = await generateBookStory(timeline, keyFrameNumbers, frameFiles.length, "en");
+  const storyEN = await generateBookStory(timeline, keyFrameNumbers, frameFiles.length, "en", cartoonTitle);
 
   // ── Verify and fix frame selections with Vision AI ──
   console.log("\nVerifying frame-text alignment (Vision AI)...");
@@ -504,7 +527,7 @@ function selectKeyFrames(timeline, sceneChanges, totalFrames) {
   return reduced.slice(0, 20);
 }
 
-async function generateBookStory(timeline, keyFrameNumbers, totalFrames, lang) {
+async function generateBookStory(timeline, keyFrameNumbers, totalFrames, lang, cartoonTitle = "Unknown") {
   const analyses = loadExistingAnalyses();
 
   const timelineText = timeline
@@ -558,13 +581,14 @@ async function generateBookStory(timeline, keyFrameNumbers, totalFrames, lang) {
     }
   }
 
+  const titleEscaped = cartoonTitle.replace(/"/g, '\\"');
   const instructions =
     lang === "pl"
-      ? `Jesteś autorem książeczek dla małych dzieci (3-5 lat). Na podstawie bajki animowanej "Milo Mechanik" stwórz PEŁNĄ książeczkę obrazkową.
+      ? `Jesteś autorem książeczek dla małych dzieci (3-5 lat). Na podstawie bajki animowanej "${titleEscaped}" stwórz PEŁNĄ książeczkę obrazkową.
 
 ABSOLUTNIE KLUCZOWA ZASADA — WIERNOŚĆ FAKTOM:
 - NIGDY nie wymyślaj wydarzeń, które NIE MA w chronologii poniżej.
-- NIGDY nie zmieniaj faktów — jeśli w oryginale Milo poszedł do samochodu po gumową kaczkę, to NIE pisz że ją złapał.
+- NIGDY nie zmieniaj faktów — jeśli w oryginale postać zrobiła X, to NIE pisz że zrobiła Y.
 - Każde zdanie w bajce MUSI mieć pokrycie w danych z chronologii.
 - Dialogi postaci cytuj DOKŁADNIE lub bardzo blisko oryginału — nie parafrazuj znacząco.
 - Jeśli nie jesteś pewien szczegółu, pomiń go zamiast zmyślać.
@@ -576,19 +600,18 @@ STYL:
 - Skup się na FABULE, DIALOGACH i UCZUCIACH postaci.
 - Używaj krótkich zdań, powtórzeń i dźwiękonaśladowczych słów (brum brum, kwa kwa, puk puk, klang!).
 - Dialogi postaci to serce bajki — wplataj je naturalnie, dużo dialogu!
-  Np. — Hmmm, co się stało? — zastanowił się Milo, drapiąc się po głowie.
 
 FORMAT:
 - Stwórz 25-35 stron. To jest prawdziwa książeczka, nie streszczenie!
 - Każda strona: 2-5 PROSTYCH zdań.
-- Elementy edukacyjne (siłownik, olej hydrauliczny) wyjaśniaj prostymi porównaniami.
-- Scena z kaczką: Marcin opiekuje się PRAWDZIWĄ kaczką, która schowała się pod półkami. Milo ma POMYSŁ — idzie do SAMOCHODU po swoją GUMOWĄ kaczkę, kładzie ją na podłodze, i dzięki niej prawdziwa kaczka wychodzi żeby ją zobaczyć — to dwa różne stworzenia!
-- Scena pakowania narzędzi (klucz, śrubokręt, młotek) — wyliczaj po kolei, dzieci lubią listy.
-- Scena liczenia monet — licz razem z dzieckiem: jedna moneta, dwie monety...
+- Gdy postacie wymieniają lub liczą przedmioty — wyliczaj po kolei, dzieci lubią listy i liczenie.
+- Gdy postać ma pomysł lub rozwiązuje problem — buduj to krok po kroku, żeby dziecko mogło śledzić logikę.
+- Gdy są podobne obiekty/zwierzęta (np. zabawka vs. prawdziwe zwierzę) — rozróżniaj je wyraźnie.
+- Elementy edukacyjne wyjaśniaj prostymi porównaniami.
 - Zakończenie musi być ciepłe i radosne.
 - Każda strona musi mieć pole "frame" z numerem klatki (od 1 do ${totalFrames}).
 - NIGDY nie powtarzaj tego samego numeru klatki! Wybieraj z RÓŻNYCH momentów bajki.
-- Przy wyborze numeru klatki ZAWSZE sprawdź opisy VISUAL w chronologii — wybierz klatke, która NAJLEPIEJ pasuje do tekstu na stronie. NIE wybieraj automatycznie pierwszej klatki z dialogu! Np. jeśli tekst mówi o skrzynce narzędziowej, wybierz klatkę której VISUAL opisuje toolbox/narzędzia, a nie postać.
+- Przy wyborze numeru klatki ZAWSZE sprawdź opisy VISUAL w chronologii — wybierz klatke, która NAJLEPIEJ pasuje do tekstu na stronie. NIE wybieraj automatycznie pierwszej klatki z dialogu!
 
 Poniżej widzisz kilka kluczowych klatek jako obrazy.
 
@@ -597,11 +620,11 @@ ${timelineText}
 
 Odpowiedz TYLKO poprawnym JSON (bez komentarzy, bez markdown):
 {"title": "Tytuł bajki", "pages": [{"frame": numer_klatki, "text": "Tekst strony..."}, ...]}`
-      : `You are a children's picture book author for ages 3-5. Based on the animated cartoon "Milo the Mechanic" data below, create a FULL picture book.
+      : `You are a children's picture book author for ages 3-5. Based on the animated cartoon "${titleEscaped}" data below, create a FULL picture book.
 
 ABSOLUTELY CRITICAL RULE — FACTUAL ACCURACY:
 - NEVER invent events that are NOT in the chronology below.
-- NEVER change facts — if Milo went to his car to get a rubber duck, do NOT write that he caught it.
+- NEVER change facts — if in the original a character did X, do NOT write that they did Y.
 - Every sentence in the book MUST be supported by data from the chronology.
 - Quote character dialogue EXACTLY or very close to the original — do not significantly paraphrase.
 - If you're unsure about a detail, skip it rather than making it up.
@@ -613,19 +636,18 @@ STYLE:
 - Focus on PLOT, DIALOGUE, and CHARACTER FEELINGS.
 - Use short sentences, repetition, onomatopoeia (vroom vroom, quack quack, knock knock, clang!).
 - Character dialogues are the heart of the story — use them generously and naturally!
-  E.g. "Hmm, what happened?" Milo wondered, scratching his head.
 
 FORMAT:
 - Create 25-35 pages. This is a real picture book, NOT a summary!
 - Each page: 2-5 SIMPLE sentences.
-- Educational parts (hydraulic cylinder, oil) — explain with simple comparisons kids understand.
-- Duck scene: Marcin cares for a REAL duck that hid under shelves. Milo has an IDEA — he goes to his CAR to get his RUBBER duck, puts it on the floor, and thanks to it the real duck comes out to see it — these are TWO different creatures!
-- Tool packing scene (wrench, screwdriver, hammer) — list them one by one, kids love lists.
-- Coin counting scene — count together: one coin, two coins...
+- When characters list or count items — narrate each one, kids love lists and counting.
+- When a character has a clever idea or solves a problem — build it up step by step so the child can follow the logic.
+- When there are similar objects/creatures (e.g. a toy vs. a real animal) — distinguish them clearly.
+- Educational parts — explain with simple comparisons kids understand.
 - Ending must be warm and happy.
 - Each page needs a "frame" field with frame number (1 to ${totalFrames}).
 - NEVER repeat the same frame number! Pick from DIFFERENT moments.
-- When choosing frame numbers, ALWAYS check the VISUAL descriptions in the chronology — pick the frame whose VISUAL best matches the page text. Do NOT default to the first frame of a dialogue! E.g. if the text is about a toolbox, pick the frame whose VISUAL describes a toolbox/tools, not a character standing.
+- When choosing frame numbers, ALWAYS check the VISUAL descriptions in the chronology — pick the frame whose VISUAL best matches the page text. Do NOT default to the first frame of a dialogue!
 
 Below you can see some key frames as images.
 
@@ -1143,15 +1165,21 @@ async function main() {
 
   await installDeps();
 
+  let cartoonTitle = "Unknown";
   if (videoUrl) {
+    cartoonTitle = await getVideoTitle(videoUrl);
+    console.log(`Cartoon: "${cartoonTitle}"`);
     const outputTemplate = path.join(DOWNLOADS_DIR, "%(title)s");
     await downloadVideo(videoUrl, outputTemplate);
     const videoPath = await getVideoFilename(videoUrl, outputTemplate);
     await extractFrames(videoPath);
-    processSubtitles(videoPath);
+    await processSubtitles(videoPath);
+  } else {
+    cartoonTitle = getCartoonTitleFromDownloads();
+    if (cartoonTitle !== "Unknown") console.log(`Cartoon: "${cartoonTitle}"`);
   }
 
-  await createBook();
+  await createBook(cartoonTitle);
 }
 
 main().catch((err) => {
